@@ -1,0 +1,7 @@
+# Ignore everything by default
+*
+
+# Keep these files
+!.gitignore
+!orb_imbalance_backtest.py
+!README.md

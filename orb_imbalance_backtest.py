@@ -1,4 +1,6 @@
 import os
+import sys
+import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 
@@ -6,140 +8,99 @@ import numpy as np
 import pandas as pd
 import pytz
 
-# Optional (only used if you actually download from Databento)
-import databento as db  # pip install databento
+import matplotlib.pyplot as plt
+
+# Databento (pip install databento)
+import databento as db
 
 
-# =========================
-# CONFIG
-# =========================
+# ============================================================
+# CONFIG (tweaked)
+# ============================================================
 
 @dataclass
 class Config:
-    # ---- Market / data ----
-    dataset: str = "GLBX.MDP3"          # CME Globex MDP 3.0 (Databento)
-    symbol: str = "NQ.v.0"              # Continuous contract front month (Databento symbology)
-    schema: str = "ohlcv-1m"            # 1-minute OHLCV schema
-    start: str = "2024-06-01"           # YYYY-MM-DD (reduced period for testing)
-    end: str = "2024-06-30"             # YYYY-MM-DD
+    # ---- Databento ----
+    dataset: str = "GLBX.MDP3"
+    symbol: str = "NQ.v.0"
+    schema: str = "ohlcv-1m"
+    start: str = "2024-06-01"
+    end: str = "2024-06-30"
+    stype_in: str = "continuous"
 
-    # ---- Session times (NY) ----
+    # ---- Timezone/session ----
     tz: str = "America/New_York"
     rth_open: str = "09:30"
-    or_end: str = "09:45"               # Opening range is [09:30, 09:45)
-    last_entry: str = "11:00"           # Stop taking new entries after this
+    or_end: str = "09:45"
     rth_close: str = "16:00"
+    last_entry: str = "10:30"
 
-    # ---- Strategy rules ----
+    # ---- Core rules ----
     max_trades_per_day: int = 2
     stop_after_first_win: bool = True
 
-    # "Imbalance" definition parameters (3-candle)
-    # Bullish imbalance: low[c3] > high[c1] AND candle2 close > open (optional)
-    require_candle2_direction: bool = True
+    clean_break_points: float = 3.0
 
-    # Risk/Reward rule from the post:
-    # If stop < 30 points => 2R else 1R
+    # Imbalance (FVG-style)
+    require_candle2_direction: bool = False
+    require_candle3_direction: bool = True
+
+    stop_mode: str = "minmax3"
+
+    # Stop buffer
+    use_fixed_stop_buffer: bool = True
+    stop_buffer_points: float = 2.0
+
+    use_risk_buffer: bool = False
+    stop_buffer_risk_frac: float = 0.25
+
+    # RR
+    stop_threshold_points: float = 30.0
     rr_small_stop: float = 2.0
     rr_big_stop: float = 1.0
-    stop_threshold_points: float = 30.0
 
-    # Optional: move stop to breakeven after price moves +1R in favor
-    use_breakeven: bool = True
+    # Retest confirmation
+    use_retest_confirmation: bool = True
+    retest_wait_bars: int = 1
+    retest_require_directional_close: bool = True
 
-    # Backtest fill assumptions (important!)
-    # If both SL and TP touched in the same 1m bar, "conservative" assumes SL hits first.
-    same_bar_rule: str = "conservative"  # "conservative" or "optimistic"
+    # Continuation filter
+    use_continuation_filter: bool = True
+    continuation_bars: int = 5
 
-    # Costs (very rough). For NQ/MNQ you might want to set commission & slippage.
-    commission_per_trade_points: float = 0.0
+    # Gap confirmation + hold
+    use_gap_confirmation: bool = True
+    gap_min_points: float = 5.0
+    gap_directional: bool = True
+
+    use_gap_hold_filter: bool = True
+    gap_hold_mode: str = "or_extreme"  # "or_extreme" or "gap_fill_50"
+    gap_fill_frac: float = 0.5
+
+    # BE (structure + RR)
+    use_breakeven_structure: bool = True
+    pivot_lookback: int = 5
+
+    use_breakeven_rr: bool = True
+    breakeven_rr_trigger: float = 0.75
+
+    # Fill assumptions
+    same_bar_rule: str = "conservative"
+
+    # Costs (points)
     slippage_points: float = 0.0
+    commission_points_roundturn: float = 0.0
+
+    # Output
+    out_csv: str = "trades_orb_imbalance_tweaked.csv"
 
 
 CFG = Config()
 
 
-# =========================
-# DATA DOWNLOAD (DATABENTO)
-# =========================
-
-def download_ohlcv_1m_from_databento(cfg: Config) -> pd.DataFrame:
-    """
-    Downloads 1-minute OHLCV from Databento and returns a DataFrame with:
-    index: timezone-aware timestamps (America/New_York)
-    columns: open, high, low, close, volume
-    """
-    api_key = os.environ.get("DATABENTO_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing DATABENTO_API_KEY environment variable.")
-
-    client = db.Historical(key=api_key)
-
-    # Databento timeseries.get_range can return OHLCV bars directly with schema ohlcv-1m.
-    # Docs: schemas include OHLCV aggregate bars like 1-minute. (schema name used by Databento is ohlcv-1m)
-    data = client.timeseries.get_range(
-        dataset=cfg.dataset,
-        schema=cfg.schema,
-        symbols=cfg.symbol,
-        stype_in="continuous",  # Important: specify continuous contract type
-        start=cfg.start,
-        end=cfg.end,
-    )
-
-    df = data.to_df()
-
-    # For DBN data, the index is already the timestamp
-    # Reset index to get timestamp as a column if needed
-    if df.index.name and 'ts_' in str(df.index.name):
-        df = df.reset_index()
-        ts_col = df.index.name if df.index.name else df.columns[0]
-    else:
-        # Look for timestamp column
-        ts_col_candidates = [c for c in df.columns if 'ts_' in c.lower()]
-        if ts_col_candidates:
-            ts_col = ts_col_candidates[0]
-        else:
-            # DBN format may have timestamp in index
-            df = df.reset_index()
-            ts_col = df.columns[0]  # Usually first column after reset
-
-    # Normalize OHLCV field names
-    col_map = {}
-    for c in df.columns:
-        cl = c.lower()
-        if cl == "open":
-            col_map[c] = "open"
-        elif cl == "high":
-            col_map[c] = "high"
-        elif cl == "low":
-            col_map[c] = "low"
-        elif cl == "close":
-            col_map[c] = "close"
-        elif cl in ("volume", "vol"):
-            col_map[c] = "volume"
-
-    df = df.rename(columns=col_map)
-
-    missing = [c for c in ["open", "high", "low", "close", "volume"] if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Missing expected OHLCV columns: {missing}. Columns: {df.columns}")
-
-    # Parse timestamps and localize to New York
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df = df.dropna(subset=[ts_col]).sort_values(ts_col)
-    df = df.set_index(ts_col)
-
-    ny = pytz.timezone(cfg.tz)
-    df.index = df.index.tz_convert(ny)
-
-    # Keep only needed columns
-    df = df[["open", "high", "low", "close", "volume"]].copy()
-    return df
-
-
-# =========================
-# STRATEGY LOGIC
-# =========================
+# ============================================================
+# TIME HELPERS
+# ============================================================
 
 def parse_time_hhmm(s: str) -> Tuple[int, int]:
     hh, mm = s.split(":")
@@ -149,9 +110,7 @@ def between_times(ts: pd.Timestamp, start_hhmm: str, end_hhmm: str) -> bool:
     sh, sm = parse_time_hhmm(start_hhmm)
     eh, em = parse_time_hhmm(end_hhmm)
     t = ts.timetz()
-    start_ok = (t.hour, t.minute) >= (sh, sm)
-    end_ok = (t.hour, t.minute) < (eh, em)
-    return start_ok and end_ok
+    return (t.hour, t.minute) >= (sh, sm) and (t.hour, t.minute) < (eh, em)
 
 def is_rth(ts: pd.Timestamp, cfg: Config) -> bool:
     return between_times(ts, cfg.rth_open, cfg.rth_close)
@@ -168,200 +127,391 @@ def candle_is_up(o: float, c: float) -> bool:
 def candle_is_down(o: float, c: float) -> bool:
     return c < o
 
-def bullish_imbalance(c1, c2, c3, require_dir: bool) -> bool:
-    # c = (open, high, low, close)
-    o1,h1,l1,c1c = c1
-    o2,h2,l2,c2c = c2
-    o3,h3,l3,c3c = c3
+
+# ============================================================
+# DATA DOWNLOAD
+# ============================================================
+
+def download_ohlcv_1m_from_databento(cfg: Config) -> pd.DataFrame:
+    api_key = os.environ.get("DATABENTO_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing DATABENTO_API_KEY env var.")
+
+    client = db.Historical(key=api_key)
+    data = client.timeseries.get_range(
+        dataset=cfg.dataset,
+        schema=cfg.schema,
+        symbols=cfg.symbol,
+        stype_in=cfg.stype_in,
+        start=cfg.start,
+        end=cfg.end,
+    )
+    df = data.to_df()
+
+    # Find timestamp column / reset index
+    if df.index.name and "ts_" in str(df.index.name).lower():
+        df = df.reset_index()
+        ts_col = df.columns[0]
+    else:
+        ts_candidates = [c for c in df.columns if "ts_" in c.lower()]
+        if ts_candidates:
+            ts_col = ts_candidates[0]
+        else:
+            df = df.reset_index()
+            ts_col = df.columns[0]
+
+    # Normalize OHLCV
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl == "open":
+            col_map[c] = "open"
+        elif cl == "high":
+            col_map[c] = "high"
+        elif cl == "low":
+            col_map[c] = "low"
+        elif cl == "close":
+            col_map[c] = "close"
+        elif cl in ("volume", "vol"):
+            col_map[c] = "volume"
+    df = df.rename(columns=col_map)
+
+    needed = ["open", "high", "low", "close", "volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Missing columns: {missing}. Have: {list(df.columns)}")
+
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    df = df.dropna(subset=[ts_col]).sort_values(ts_col).set_index(ts_col)
+
+    ny = pytz.timezone(cfg.tz)
+    df.index = df.index.tz_convert(ny)
+
+    return df[needed].copy()
+
+
+# ============================================================
+# IMBALANCE + STOP
+# ============================================================
+
+def bullish_imbalance(c1, c2, c3, cfg: Config) -> bool:
+    (o1, h1, l1, c1c) = c1
+    (o2, h2, l2, c2c) = c2
+    (o3, h3, l3, c3c) = c3
     cond_gap = l3 > h1
-    cond_dir = candle_is_up(o2, c2c) if require_dir else True
-    return cond_gap and cond_dir
+    cond_dir2 = candle_is_up(o2, c2c) if cfg.require_candle2_direction else True
+    cond_dir3 = candle_is_up(o3, c3c) if cfg.require_candle3_direction else True
+    return cond_gap and cond_dir2 and cond_dir3
 
-def bearish_imbalance(c1, c2, c3, require_dir: bool) -> bool:
-    o1,h1,l1,c1c = c1
-    o2,h2,l2,c2c = c2
-    o3,h3,l3,c3c = c3
+def bearish_imbalance(c1, c2, c3, cfg: Config) -> bool:
+    (o1, h1, l1, c1c) = c1
+    (o2, h2, l2, c2c) = c2
+    (o3, h3, l3, c3c) = c3
     cond_gap = h3 < l1
-    cond_dir = candle_is_down(o2, c2c) if require_dir else True
-    return cond_gap and cond_dir
+    cond_dir2 = candle_is_down(o2, c2c) if cfg.require_candle2_direction else True
+    cond_dir3 = candle_is_down(o3, c3c) if cfg.require_candle3_direction else True
+    return cond_gap and cond_dir2 and cond_dir3
 
-@dataclass
-class Trade:
-    date: str
-    direction: str  # "long" / "short"
-    entry_time: str
-    entry: float
-    stop: float
-    tp: float
-    exit_time: str
-    exit: float
-    result_r: float
-    reason: str  # "TP" / "SL" / "EOD" / "BE"
-    risk_points: float
+def compute_stop_base(direction: str, r1, r2, r3, cfg: Config) -> float:
+    if cfg.stop_mode not in ("minmax3", "c1", "c2", "c3"):
+        raise ValueError("stop_mode must be one of: minmax3, c1, c2, c3")
+
+    if direction == "long":
+        if cfg.stop_mode == "minmax3":
+            return float(min(r1["low"], r2["low"], r3["low"]))
+        if cfg.stop_mode == "c1":
+            return float(r1["low"])
+        if cfg.stop_mode == "c2":
+            return float(r2["low"])
+        return float(r3["low"])
+
+    if cfg.stop_mode == "minmax3":
+        return float(max(r1["high"], r2["high"], r3["high"]))
+    if cfg.stop_mode == "c1":
+        return float(r1["high"])
+    if cfg.stop_mode == "c2":
+        return float(r2["high"])
+    return float(r3["high"])
+
+def apply_stop_buffers(direction: str, entry: float, stop_base: float, cfg: Config) -> float:
+    stop = float(stop_base)
+
+    if cfg.use_fixed_stop_buffer and cfg.stop_buffer_points > 0:
+        stop = stop - cfg.stop_buffer_points if direction == "long" else stop + cfg.stop_buffer_points
+
+    if cfg.use_risk_buffer and cfg.stop_buffer_risk_frac > 0:
+        risk0 = (entry - stop) if direction == "long" else (stop - entry)
+        if risk0 > 0:
+            extra = cfg.stop_buffer_risk_frac * risk0
+            stop = stop - extra if direction == "long" else stop + extra
+
+    return stop
 
 
-def simulate_trade_path(
+# ============================================================
+# BE STRUCTURE
+# ============================================================
+
+def is_pivot_high(highs: np.ndarray, i: int, lb: int) -> bool:
+    center = highs[i]
+    left = highs[i - lb:i]
+    right = highs[i + 1:i + lb + 1]
+    return np.all(center > left) and np.all(center > right)
+
+def is_pivot_low(lows: np.ndarray, i: int, lb: int) -> bool:
+    center = lows[i]
+    left = lows[i - lb:i]
+    right = lows[i + 1:i + lb + 1]
+    return np.all(center < left) and np.all(center < right)
+
+
+def simulate_trade(
     day_df: pd.DataFrame,
-    entry_idx: int,
+    entry_i: int,
     direction: str,
     entry: float,
     stop: float,
     tp: float,
     cfg: Config
-) -> Tuple[int, float, str]:
-    """
-    Walk forward bar-by-bar from entry_idx+1 to end of day to see where SL/TP hits.
-    Returns: (exit_bar_index, exit_price, reason)
-    """
-    # Apply slippage/commission as points; simplistic:
+) -> Tuple[int, float, str, bool, bool]:
     entry_eff = entry + (cfg.slippage_points if direction == "long" else -cfg.slippage_points)
-
-    # Breakeven activation:
-    risk = abs(entry_eff - stop)
-    be_activated = False
     be_price = entry_eff
 
-    for i in range(entry_idx + 1, len(day_df)):
-        row = day_df.iloc[i]
-        high = float(row["high"])
-        low = float(row["low"])
-        close = float(row["close"])
+    moved_to_be = False
+    be_active = False
+    pivot_be_used = False
 
-        # Optional: activate BE after +1R
-        if cfg.use_breakeven and not be_activated:
-            if direction == "long" and high >= entry_eff + risk:
-                be_activated = True
-            elif direction == "short" and low <= entry_eff - risk:
-                be_activated = True
+    highs = day_df["high"].to_numpy(dtype=float)
+    lows = day_df["low"].to_numpy(dtype=float)
 
-        # Determine current effective stop (BE or original)
-        cur_stop = stop
-        if be_activated:
-            cur_stop = be_price  # move stop to entry
+    lb = int(cfg.pivot_lookback)
+    last_pivot_level: Optional[float] = None
 
-        # Check hits in this bar
-        hit_sl = (low <= cur_stop) if direction == "long" else (high >= cur_stop)
-        hit_tp = (high >= tp) if direction == "long" else (low <= tp)
+    risk = abs(entry_eff - stop)
+
+    for i in range(entry_i + 1, len(day_df)):
+        hi = float(day_df.iloc[i]["high"])
+        lo = float(day_df.iloc[i]["low"])
+
+        # BE by RR
+        if cfg.use_breakeven_rr and not be_active and risk > 0:
+            if direction == "long" and hi >= entry_eff + cfg.breakeven_rr_trigger * risk:
+                be_active = True
+                moved_to_be = True
+            elif direction == "short" and lo <= entry_eff - cfg.breakeven_rr_trigger * risk:
+                be_active = True
+                moved_to_be = True
+
+        # BE by structure (pivot break)
+        if cfg.use_breakeven_structure and not be_active:
+            k = i - lb
+            if k - lb >= entry_i and k + lb < len(day_df):
+                if direction == "long" and is_pivot_high(highs, k, lb):
+                    last_pivot_level = float(highs[k])
+                if direction == "short" and is_pivot_low(lows, k, lb):
+                    last_pivot_level = float(lows[k])
+
+            if last_pivot_level is not None:
+                if direction == "long" and hi > last_pivot_level:
+                    be_active = True
+                    moved_to_be = True
+                    pivot_be_used = True
+                elif direction == "short" and lo < last_pivot_level:
+                    be_active = True
+                    moved_to_be = True
+                    pivot_be_used = True
+
+        cur_stop = be_price if be_active else stop
+
+        hit_sl = (lo <= cur_stop) if direction == "long" else (hi >= cur_stop)
+        hit_tp = (hi >= tp) if direction == "long" else (lo <= tp)
 
         if hit_sl and hit_tp:
-            # Ambiguous within same 1m bar. Choose rule.
             if cfg.same_bar_rule == "conservative":
-                return i, cur_stop, ("BE" if be_activated else "SL")
-            else:
-                return i, tp, "TP"
+                return i, cur_stop, ("BE" if be_active else "SL"), moved_to_be, pivot_be_used
+            return i, tp, "TP", moved_to_be, pivot_be_used
 
         if hit_sl:
-            return i, cur_stop, ("BE" if be_activated else "SL")
-
+            return i, cur_stop, ("BE" if be_active else "SL"), moved_to_be, pivot_be_used
         if hit_tp:
-            return i, tp, "TP"
+            return i, tp, "TP", moved_to_be, pivot_be_used
 
-    # If no hit by end of day, exit at last close
-    return len(day_df) - 1, float(day_df.iloc[-1]["close"]), "EOD"
+    return len(day_df) - 1, float(day_df.iloc[-1]["close"]), "EOD", moved_to_be, pivot_be_used
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+@dataclass
+class Trade:
+    date: str
+    direction: str
+    entry_time: str
+    exit_time: str
+    entry: float
+    stop: float
+    tp: float
+    exit: float
+    result_r: float
+    reason: str
+    risk_points: float
+    gap_points: float
+    moved_to_be: bool
+    be_by_pivot: bool
 
 
 def backtest_orb_imbalance(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """
-    Core backtest: returns trades as DataFrame
-    """
-    if df.index.tz is None:
-        raise ValueError("DataFrame index must be timezone-aware (America/New_York).")
-
-    # Keep only RTH rows for simplicity
-    df = df[df.index.map(lambda ts: is_rth(ts, cfg))].copy()
-
     trades: List[Trade] = []
+    df = df.sort_index().copy()
 
-    for day, day_df in df.groupby(df.index.date):
-        day_df = day_df.copy()
-        day_df["time"] = day_df.index
+    rth_mask = df.index.map(lambda ts: is_rth(ts, cfg))
+    df_rth = df[rth_mask].copy()
+    rth_close_by_day = df_rth.groupby(df_rth.index.date)["close"].last().to_dict()
 
-        # Build opening range from 09:30 to 09:45 (exclusive)
-        or_df = day_df[day_df["time"].map(lambda ts: is_or_window(ts, cfg))]
+    for day, day_df_all in df.groupby(df.index.date):
+        day_df_rth = day_df_all[day_df_all.index.map(lambda ts: is_rth(ts, cfg))].copy()
+        if len(day_df_rth) < 50:
+            continue
+
+        or_df = day_df_rth[day_df_rth.index.map(lambda ts: is_or_window(ts, cfg))]
         if len(or_df) < 5:
             continue
 
         or_high = float(or_df["high"].max())
         or_low = float(or_df["low"].min())
+        today_open = float(or_df.iloc[0]["open"])
 
-        # Only look for entries after 09:45 until last_entry
-        scan_df = day_df[day_df["time"].map(lambda ts: is_entry_window(ts, cfg))]
-        if len(scan_df) < 10:
+        prev_day = (pd.Timestamp(day) - pd.Timedelta(days=1)).date()
+        prev_rth_close = rth_close_by_day.get(prev_day, None)
+        gap = 0.0 if prev_rth_close is None else (today_open - float(prev_rth_close))
+
+        scan_df = day_df_rth[day_df_rth.index.map(lambda ts: is_entry_window(ts, cfg))]
+        if len(scan_df) < 5:
             continue
+
+        pos_map: Dict[pd.Timestamp, int] = {ts: i for i, ts in enumerate(day_df_rth.index)}
 
         day_trades = 0
         first_trade_won = False
 
-        # We'll scan bar by bar in the entry window
-        scan_idx = scan_df.index
-        # map index positions to the day_df integer positions
-        day_df_reset = day_df.reset_index(drop=False).rename(columns={"index": "ts"})
-        # We'll use integer indexing; create a mapping from timestamp -> integer position
-        pos_map: Dict[pd.Timestamp, int] = {ts: i for i, ts in enumerate(day_df["time"])}
-
-        # We need 3-bar windows for imbalance check, so iterate over bars with enough lookback.
-        for ts in scan_idx:
+        for ts in scan_df.index:
             if day_trades >= cfg.max_trades_per_day:
                 break
             if cfg.stop_after_first_win and first_trade_won:
                 break
 
             i = pos_map[ts]
-            # Need c1,c2,c3 ending at i (i is candle 3)
             if i < 2:
                 continue
 
-            # Breakout condition must have happened before/at imbalance completion.
-            close_i = float(day_df.iloc[i]["close"])
+            close_i = float(day_df_rth.iloc[i]["close"])
 
-            # Determine direction based on close relative to OR
             direction: Optional[str] = None
-            if close_i > or_high:
+            if close_i >= (or_high + cfg.clean_break_points):
                 direction = "long"
-            elif close_i < or_low:
+            elif close_i <= (or_low - cfg.clean_break_points):
                 direction = "short"
             else:
-                continue  # no close outside OR -> no setup
+                continue
 
-            # Define c1,c2,c3 for imbalance
-            r1 = day_df.iloc[i - 2]
-            r2 = day_df.iloc[i - 1]
-            r3 = day_df.iloc[i]
+            # Gap confirmation
+            if cfg.use_gap_confirmation and prev_rth_close is not None:
+                if cfg.gap_directional:
+                    if direction == "long" and gap < cfg.gap_min_points:
+                        continue
+                    if direction == "short" and gap > -cfg.gap_min_points:
+                        continue
+                else:
+                    if abs(gap) < cfg.gap_min_points:
+                        continue
+
+            # Continuation filter
+            if cfg.use_continuation_filter:
+                j_end = min(i + cfg.continuation_bars, len(day_df_rth) - 1)
+                window = day_df_rth.iloc[i:j_end + 1]
+                if direction == "long":
+                    if float(window["high"].max()) <= float(day_df_rth.iloc[i]["high"]):
+                        continue
+                else:
+                    if float(window["low"].min()) >= float(day_df_rth.iloc[i]["low"]):
+                        continue
+
+            # Imbalance
+            r1 = day_df_rth.iloc[i - 2]
+            r2 = day_df_rth.iloc[i - 1]
+            r3 = day_df_rth.iloc[i]
 
             c1 = (float(r1["open"]), float(r1["high"]), float(r1["low"]), float(r1["close"]))
             c2 = (float(r2["open"]), float(r2["high"]), float(r2["low"]), float(r2["close"]))
             c3 = (float(r3["open"]), float(r3["high"]), float(r3["low"]), float(r3["close"]))
 
-            ok = False
-            if direction == "long":
-                ok = bullish_imbalance(c1, c2, c3, cfg.require_candle2_direction)
-            else:
-                ok = bearish_imbalance(c1, c2, c3, cfg.require_candle2_direction)
-
+            ok = bullish_imbalance(c1, c2, c3, cfg) if direction == "long" else bearish_imbalance(c1, c2, c3, cfg)
             if not ok:
                 continue
 
-            # Entry at close of candle 3
+            # initial entry on close of imbalance candle
+            entry_i = i
             entry = close_i
 
-            # Stop at imbalance low/high
-            if direction == "long":
-                stop = min(c1[2], c2[2], c3[2])  # low of 3 candles (more robust than only c3)
-                risk_points = entry - stop
-            else:
-                stop = max(c1[1], c2[1], c3[1])  # high of 3 candles
-                risk_points = stop - entry
+            stop_base = compute_stop_base(direction, r1, r2, r3, cfg)
+            stop = apply_stop_buffers(direction, entry, stop_base, cfg)
 
+            # Retest confirmation
+            if cfg.use_retest_confirmation:
+                wait = int(cfg.retest_wait_bars)
+                if entry_i + wait >= len(day_df_rth):
+                    continue
+                entry_i2 = entry_i + wait
+                bar = day_df_rth.iloc[entry_i2]
+
+                imb_low = float(min(r1["low"], r2["low"], r3["low"]))
+                imb_high = float(max(r1["high"], r2["high"], r3["high"]))
+
+                if direction == "long":
+                    if float(bar["low"]) < imb_low:
+                        continue
+                    if cfg.retest_require_directional_close and not candle_is_up(float(bar["open"]), float(bar["close"])):
+                        continue
+                else:
+                    if float(bar["high"]) > imb_high:
+                        continue
+                    if cfg.retest_require_directional_close and not candle_is_down(float(bar["open"]), float(bar["close"])):
+                        continue
+
+                entry_i = entry_i2
+                entry = float(bar["close"])
+                stop = apply_stop_buffers(direction, entry, stop_base, cfg)
+
+            # Gap hold filter
+            if cfg.use_gap_hold_filter and prev_rth_close is not None and cfg.use_gap_confirmation:
+                pre_entry = day_df_rth.iloc[:entry_i + 1]
+                if cfg.gap_hold_mode == "or_extreme":
+                    if direction == "long":
+                        if float(pre_entry["low"].min()) < or_low:
+                            continue
+                    else:
+                        if float(pre_entry["high"].max()) > or_high:
+                            continue
+                elif cfg.gap_hold_mode == "gap_fill_50" and gap != 0:
+                    fill_level = today_open - cfg.gap_fill_frac * gap
+                    if direction == "long":
+                        if float(pre_entry["low"].min()) <= min(today_open, fill_level):
+                            continue
+                    else:
+                        if float(pre_entry["high"].max()) >= max(today_open, fill_level):
+                            continue
+
+            risk_points = (entry - stop) if direction == "long" else (stop - entry)
             if risk_points <= 0:
                 continue
 
             rr = cfg.rr_small_stop if risk_points < cfg.stop_threshold_points else cfg.rr_big_stop
             tp = entry + rr * risk_points if direction == "long" else entry - rr * risk_points
 
-            # Simulate forward
-            exit_i, exit_px, reason = simulate_trade_path(
-                day_df=day_df,
-                entry_idx=i,
+            exit_i, exit_px, reason, moved_to_be, be_by_pivot = simulate_trade(
+                day_df=day_df_rth,
+                entry_i=entry_i,
                 direction=direction,
                 entry=entry,
                 stop=stop,
@@ -369,43 +519,135 @@ def backtest_orb_imbalance(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                 cfg=cfg
             )
 
-            # Apply simplistic commission in points to result
-            # (Deduct commission on both entry+exit)
-            commission_pts = cfg.commission_per_trade_points
-
-            # R multiple
             pnl_points = (exit_px - entry) if direction == "long" else (entry - exit_px)
-            pnl_points -= commission_pts
+            pnl_points -= cfg.commission_points_roundturn
             result_r = pnl_points / risk_points
 
-            t = Trade(
+            trades.append(Trade(
                 date=str(day),
                 direction=direction,
-                entry_time=str(day_df.iloc[i]["time"]),
+                entry_time=str(day_df_rth.index[entry_i]),
+                exit_time=str(day_df_rth.index[exit_i]),
                 entry=float(entry),
                 stop=float(stop),
                 tp=float(tp),
-                exit_time=str(day_df.iloc[exit_i]["time"]),
                 exit=float(exit_px),
                 result_r=float(result_r),
                 reason=reason,
                 risk_points=float(risk_points),
-            )
-            trades.append(t)
+                gap_points=float(gap),
+                moved_to_be=bool(moved_to_be),
+                be_by_pivot=bool(be_by_pivot),
+            ))
 
             day_trades += 1
             if result_r > 0:
                 first_trade_won = True
 
-        # end day loop
-
-    trades_df = pd.DataFrame([t.__dict__ for t in trades])
-    return trades_df
+    return pd.DataFrame([t.__dict__ for t in trades])
 
 
-# =========================
-# METRICS
-# =========================
+# ============================================================
+# PLOTTING (for viewer)
+# ============================================================
+
+def plot_trade(
+    day_df_rth: pd.DataFrame,
+    trade_row: pd.Series,
+    cfg: Config,
+    or_high: float,
+    or_low: float,
+):
+    """
+    Plot close + (high/low faint), entry/stop/tp, and OR box.
+    trade_row needs: direction, entry_time, exit_time, entry, stop, tp, exit, reason, result_r
+    """
+    entry_time = pd.to_datetime(trade_row["entry_time"])
+    exit_time = pd.to_datetime(trade_row["exit_time"])
+
+    # Plot window: 09:30 to 16:00 (RTH)
+    x = day_df_rth.index
+    close = day_df_rth["close"].astype(float).to_numpy()
+    hi = day_df_rth["high"].astype(float).to_numpy()
+    lo = day_df_rth["low"].astype(float).to_numpy()
+
+    entry = float(trade_row["entry"])
+    stop = float(trade_row["stop"])
+    tp = float(trade_row["tp"])
+
+    title = f'{trade_row["date"]} | {trade_row["direction"].upper()} | {trade_row["reason"]} | R={float(trade_row["result_r"]):.2f}'
+    plt.figure(figsize=(14, 6))
+    plt.title(title, fontsize=14)
+
+    plt.plot(x, close, linewidth=1.8, label="Close")
+    plt.plot(x, hi, linewidth=0.8, alpha=0.25, label="High")
+    plt.plot(x, lo, linewidth=0.8, alpha=0.25, label="Low")
+
+    # OR box lines
+    plt.axhline(or_high, linestyle="--", linewidth=1.0, alpha=0.4, label="OR High")
+    plt.axhline(or_low, linestyle="--", linewidth=1.0, alpha=0.4, label="OR Low")
+
+    # Entry/Stop/TP
+    plt.axhline(entry, linestyle="--", linewidth=2.0, label=f"Entry {entry:.2f}")
+    plt.axhline(stop, linestyle="--", linewidth=2.0, label=f"Stop {stop:.2f}")
+    plt.axhline(tp, linestyle="--", linewidth=2.0, label=f"TP {tp:.2f}")
+
+    # entry/exit markers
+    if entry_time in day_df_rth.index:
+        plt.scatter([entry_time], [entry], s=90, zorder=5, label="Entry")
+        plt.axvline(entry_time, linewidth=2.0, alpha=0.25)
+    if exit_time in day_df_rth.index:
+        exit_px = float(trade_row["exit"])
+        plt.scatter([exit_time], [exit_px], s=90, marker="x", zorder=6, label="Exit")
+        plt.axvline(exit_time, linewidth=2.0, alpha=0.25)
+
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.show()
+
+
+def view_trades(csv_path: str, cfg: Config):
+    trades = pd.read_csv(csv_path)
+    if trades.empty:
+        print(f"No trades in {csv_path}")
+        return
+
+    print(f"Loaded {len(trades)} trades from {csv_path}")
+    print(trades[["date", "direction", "entry_time", "exit_time", "entry", "stop", "tp", "result_r", "reason"]].head(20))
+
+    print("\nDownloading data for visualization...")
+    df = download_ohlcv_1m_from_databento(cfg)
+
+    # Precompute RTH closes for gap, and per-day RTH slice
+    df_rth = df[df.index.map(lambda ts: is_rth(ts, cfg))].copy()
+
+    for idx, tr in trades.iterrows():
+        day = pd.to_datetime(tr["date"]).date()
+        day_df_rth = df_rth[df_rth.index.date == day].copy()
+        if day_df_rth.empty:
+            print(f"[{idx+1}/{len(trades)}] Missing day data: {day}")
+            continue
+
+        # compute OR levels for that day
+        or_df = day_df_rth[day_df_rth.index.map(lambda ts: is_or_window(ts, cfg))]
+        if len(or_df) < 2:
+            print(f"[{idx+1}/{len(trades)}] Missing OR slice for {day}")
+            continue
+        or_high = float(or_df["high"].max())
+        or_low = float(or_df["low"].min())
+
+        print(f'\n[{idx+1}/{len(trades)}] {tr["date"]} {tr["direction"].upper()} @ {float(tr["entry"]):.2f}')
+        print(f'    Entry: {tr["entry_time"]}')
+        print(f'    Exit : {tr["exit_time"]} ({tr["reason"]})  R={float(tr["result_r"]):.2f}')
+        print("Closing each chart window will show the next trade.")
+
+        plot_trade(day_df_rth, tr, cfg, or_high, or_low)
+
+
+# ============================================================
+# STATS + MAIN
+# ============================================================
 
 def compute_stats(trades: pd.DataFrame) -> Dict[str, float]:
     if trades.empty:
@@ -418,54 +660,75 @@ def compute_stats(trades: pd.DataFrame) -> Dict[str, float]:
     equity = r.cumsum()
     peak = equity.cummax()
     dd = equity - peak
-    max_dd = dd.min() if len(dd) else 0.0
+    max_dd = float(dd.min()) if len(dd) else 0.0
 
-    profit_factor = wins.sum() / abs(losses.sum()) if abs(losses.sum()) > 1e-12 else np.inf
+    pf = float(wins.sum() / abs(losses.sum())) if abs(losses.sum()) > 1e-12 else float("inf")
 
-    stats = {
+    return {
         "trades": float(len(trades)),
         "win_rate": float((r > 0).mean()),
         "avg_r": float(r.mean()),
         "median_r": float(r.median()),
-        "expectancy_r": float(r.mean()),
-        "profit_factor": float(profit_factor),
-        "max_drawdown_r": float(max_dd),
+        "profit_factor": pf,
+        "max_drawdown_r": max_dd,
         "best_r": float(r.max()),
         "worst_r": float(r.min()),
+        "moved_to_be_rate": float(trades["moved_to_be"].mean()) if "moved_to_be" in trades else 0.0,
+        "be_by_pivot_rate": float(trades["be_by_pivot"].mean()) if "be_by_pivot" in trades else 0.0,
     }
-    return stats
 
 
-# =========================
-# MAIN
-# =========================
+def run_backtest(cfg: Config) -> pd.DataFrame:
+    print("=== ORB + Imbalance (Tweaked) Backtest ===")
+    print(f"Dataset={cfg.dataset} Symbol={cfg.symbol} Range={cfg.start} -> {cfg.end}")
+    print(f"OR: {cfg.rth_open}-{cfg.or_end} | Entries until {cfg.last_entry}")
+    print(f"CleanBreak={cfg.clean_break_points} | GapConfirm={cfg.use_gap_confirmation} (min={cfg.gap_min_points}, directional={cfg.gap_directional})")
+    print(f"StopMode={cfg.stop_mode} | StopBuffer(fixed)={cfg.use_fixed_stop_buffer}:{cfg.stop_buffer_points} | StopBuffer(risk)={cfg.use_risk_buffer}:{cfg.stop_buffer_risk_frac}")
+    print(f"RetestConfirm={cfg.use_retest_confirmation} wait={cfg.retest_wait_bars} directional_close={cfg.retest_require_directional_close}")
+    print(f"ContinuationFilter={cfg.use_continuation_filter} bars={cfg.continuation_bars}")
+    print(f"BE: structure={cfg.use_breakeven_structure} pivot_lb={cfg.pivot_lookback} | rr={cfg.use_breakeven_rr} at {cfg.breakeven_rr_trigger}R")
+    print(f"RR: <{cfg.stop_threshold_points} pts => {cfg.rr_small_stop}R, else {cfg.rr_big_stop}R")
+    print(f"GapHold={cfg.use_gap_hold_filter} mode={cfg.gap_hold_mode}")
 
-def main():
-    print("=== ORB + Imbalance Backtest ===")
-    print(f"Dataset={CFG.dataset} Symbol={CFG.symbol} Schema={CFG.schema} Range={CFG.start} -> {CFG.end}")
-
-    # 1) Download data
-    df = download_ohlcv_1m_from_databento(CFG)
-    print(f"Downloaded bars: {len(df):,}")
+    df = download_ohlcv_1m_from_databento(cfg)
+    print(f"\nDownloaded bars: {len(df):,}")
     print(df.head())
 
-    # 2) Backtest
-    trades = backtest_orb_imbalance(df, CFG)
+    trades = backtest_orb_imbalance(df, cfg)
+    trades.to_csv(cfg.out_csv, index=False)
+    print(f"\nSaved trades to: {cfg.out_csv}")
 
-    # 3) Save results
-    out_trades = "trades_orb_imbalance.csv"
-    trades.to_csv(out_trades, index=False)
-    print(f"Saved trades to: {out_trades}")
-
-    # 4) Stats
     stats = compute_stats(trades)
-    print("\n=== STATS (R-multiples) ===")
+    print("\n=== STATS (R multiples) ===")
     for k, v in stats.items():
-        print(f"{k:>16}: {v}")
+        print(f"{k:>20}: {v}")
 
     if not trades.empty:
-        print("\nSample trades:")
-        print(trades.head(10))
+        print("\nSample trades (with entry/exit times):")
+        show = trades[[
+            "date", "direction", "entry_time", "exit_time",
+            "entry", "stop", "tp", "exit",
+            "result_r", "reason"
+        ]].head(20)
+        print(show.to_string(index=False))
+
+    return trades
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--view", action="store_true", help="View charts for trades in CSV.")
+    parser.add_argument("--csv", type=str, default=CFG.out_csv, help="CSV path to view (default: out_csv).")
+    args = parser.parse_args()
+
+    if args.view:
+        if not os.path.exists(args.csv):
+            print(f"CSV not found: {args.csv}")
+            print("Run backtest first: python orb_imbalance_backtest_improved.py")
+            sys.exit(1)
+        view_trades(args.csv, CFG)
+    else:
+        run_backtest(CFG)
 
 
 if __name__ == "__main__":
